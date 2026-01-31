@@ -31,6 +31,10 @@
 #include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+#if ENABLE_SHM_QUEUE
+#include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/executor/shmQueueWrapper.h"
+#endif
 
 #include <atomic>
 #include <condition_variable>
@@ -48,7 +52,8 @@ namespace tensorrt_llm::executor
 class RequestWithIdAsyncSend;
 class CancelledRequestsAsyncSend;
 
-class MpiMessageQueue
+// Original mutex-based implementation (kept for fallback)
+class MpiMessageQueueMutex
 {
 public:
     void push(MpiMessage&& message)
@@ -71,6 +76,62 @@ private:
     std::queue<MpiMessage> mQueue;
     std::mutex mMutex;
     std::condition_variable mCv;
+};
+
+// Wrapper class that selects implementation based on build flag and env var
+class MpiMessageQueue
+{
+public:
+    MpiMessageQueue()
+    {
+#if ENABLE_SHM_QUEUE
+        if (tensorrt_llm::common::getEnvUseSHMQueue())
+        {
+            useSHM_ = true;
+            shmQueue_ = std::make_unique<ShmMessageQueue>();
+        }
+        else
+#endif
+        {
+            useSHM_ = false;
+            mutexQueue_ = std::make_unique<MpiMessageQueueMutex>();
+        }
+    }
+
+    void push(MpiMessage&& message)
+    {
+#if ENABLE_SHM_QUEUE
+        if (useSHM_)
+        {
+            shmQueue_->push(std::move(message));
+        }
+        else
+#endif
+        {
+            mutexQueue_->push(std::move(message));
+        }
+    }
+
+    MpiMessage pop()
+    {
+#if ENABLE_SHM_QUEUE
+        if (useSHM_)
+        {
+            return shmQueue_->pop();
+        }
+        else
+#endif
+        {
+            return mutexQueue_->pop();
+        }
+    }
+
+private:
+    bool useSHM_ = false;
+#if ENABLE_SHM_QUEUE
+    std::unique_ptr<ShmMessageQueue> shmQueue_;
+#endif
+    std::unique_ptr<MpiMessageQueueMutex> mutexQueue_;
 };
 
 class Executor::Impl

@@ -570,6 +570,11 @@ bool getEnvPrintSkipSoftmaxStat()
     return getBoolEnv("TRTLLM_PRINT_SKIP_SOFTMAX_STAT");
 }
 
+bool getEnvUseSHMQueue()
+{
+    return getBoolEnv("TRTLLM_USE_SHM_QUEUE");
+}
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END

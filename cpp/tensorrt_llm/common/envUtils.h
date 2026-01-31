@@ -163,6 +163,8 @@ bool getEnvEplbForceGdrcopy();
 
 bool getEnvPrintSkipSoftmaxStat();
 
+bool getEnvUseSHMQueue();
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END

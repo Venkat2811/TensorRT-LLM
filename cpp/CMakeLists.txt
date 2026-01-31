@@ -51,6 +51,8 @@ option(CUBLAS_DYNAMIC_LINKING
 option(CURAND_DYNAMIC_LINKING "Link against the dynamic curand library" ON)
 
 option(ENABLE_NVSHMEM "Enable building with NVSHMEM support" OFF)
+option(ENABLE_SHM_QUEUE
+       "Enable shared memory queue for MpiMessageQueue (experimental)" OFF)
 option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
        "Using open sourced Cutlass low latency gemm kernel" ON)
 option(USING_OSS_CUTLASS_FP4_GEMM "Using open sourced Cutlass fp4 gemm kernel"
@@ -345,6 +347,16 @@ else()
   # Add target definitions for both C++ and CUDA
   add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_MULTI_DEVICE=0>
                           $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_MULTI_DEVICE=0>)
+endif()
+
+# SHM Queue compile definition
+if(ENABLE_SHM_QUEUE)
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_SHM_QUEUE=1>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_SHM_QUEUE=1>)
+  message(STATUS "SHM Queue: ENABLED (experimental)")
+else()
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_SHM_QUEUE=0>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_SHM_QUEUE=0>)
 endif()
 
 if(ENABLE_NVSHMEM)
