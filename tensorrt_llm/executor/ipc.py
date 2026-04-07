@@ -21,65 +21,184 @@ from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
 
 _MYELON_INSTRUMENT = os.environ.get('TRTLLM_MYELON_INSTRUMENT', '0') == '1'
 
+# Use time.perf_counter_ns for nanosecond resolution when available
+_perf_ns = time.perf_counter_ns
+
 
 class _IpcStats:
-    """Lightweight IPC timing accumulator. Only active when TRTLLM_MYELON_INSTRUMENT=1."""
+    """Nanosecond-granular IPC timing accumulator.
 
-    __slots__ = ('name', 'put_count', 'put_total_us', 'put_max_us',
-                 'get_count', 'get_total_us', 'get_max_us',
-                 'pickle_total_us', 'hmac_total_us', 'zmq_send_total_us',
-                 'unpickle_total_us', 'hmac_verify_total_us', 'zmq_recv_total_us')
+    Tracks per-phase breakdown: pickle, hmac, zmq_send/recv, unpickle.
+    Also tracks payload sizes in bytes. All active only when TRTLLM_MYELON_INSTRUMENT=1.
+    """
+
+    __slots__ = (
+        'name',
+        # put (send) stats — all in nanoseconds
+        'put_count', 'put_total_ns', 'put_max_ns', 'put_min_ns',
+        'pickle_total_ns', 'pickle_max_ns',
+        'hmac_sign_total_ns', 'hmac_sign_max_ns',
+        'zmq_send_total_ns', 'zmq_send_max_ns',
+        'put_bytes_total', 'put_bytes_max',
+        # get (recv) stats — all in nanoseconds
+        'get_count', 'get_total_ns', 'get_max_ns', 'get_min_ns',
+        'zmq_recv_total_ns', 'zmq_recv_max_ns',
+        'hmac_verify_total_ns', 'hmac_verify_max_ns',
+        'unpickle_total_ns', 'unpickle_max_ns',
+        'get_bytes_total', 'get_bytes_max',
+        # async variants
+        'put_async_count', 'put_async_total_ns',
+        'get_async_count', 'get_async_total_ns',
+    )
 
     def __init__(self, name: str):
         self.name = name
         self.put_count = 0
-        self.put_total_us = 0
-        self.put_max_us = 0
+        self.put_total_ns = 0
+        self.put_max_ns = 0
+        self.put_min_ns = 2**63
+        self.pickle_total_ns = 0
+        self.pickle_max_ns = 0
+        self.hmac_sign_total_ns = 0
+        self.hmac_sign_max_ns = 0
+        self.zmq_send_total_ns = 0
+        self.zmq_send_max_ns = 0
+        self.put_bytes_total = 0
+        self.put_bytes_max = 0
         self.get_count = 0
-        self.get_total_us = 0
-        self.get_max_us = 0
-        self.pickle_total_us = 0
-        self.hmac_total_us = 0
-        self.zmq_send_total_us = 0
-        self.unpickle_total_us = 0
-        self.hmac_verify_total_us = 0
-        self.zmq_recv_total_us = 0
+        self.get_total_ns = 0
+        self.get_max_ns = 0
+        self.get_min_ns = 2**63
+        self.zmq_recv_total_ns = 0
+        self.zmq_recv_max_ns = 0
+        self.hmac_verify_total_ns = 0
+        self.hmac_verify_max_ns = 0
+        self.unpickle_total_ns = 0
+        self.unpickle_max_ns = 0
+        self.get_bytes_total = 0
+        self.get_bytes_max = 0
+        self.put_async_count = 0
+        self.put_async_total_ns = 0
+        self.get_async_count = 0
+        self.get_async_total_ns = 0
 
-    def record_put(self, total_us, pickle_us, hmac_us, zmq_us):
+    def record_put(self, total_ns: int, pickle_ns: int, hmac_ns: int,
+                   zmq_ns: int, payload_bytes: int):
         self.put_count += 1
-        self.put_total_us += total_us
-        if total_us > self.put_max_us:
-            self.put_max_us = total_us
-        self.pickle_total_us += pickle_us
-        self.hmac_total_us += hmac_us
-        self.zmq_send_total_us += zmq_us
+        self.put_total_ns += total_ns
+        if total_ns > self.put_max_ns:
+            self.put_max_ns = total_ns
+        if total_ns < self.put_min_ns:
+            self.put_min_ns = total_ns
+        self.pickle_total_ns += pickle_ns
+        if pickle_ns > self.pickle_max_ns:
+            self.pickle_max_ns = pickle_ns
+        self.hmac_sign_total_ns += hmac_ns
+        if hmac_ns > self.hmac_sign_max_ns:
+            self.hmac_sign_max_ns = hmac_ns
+        self.zmq_send_total_ns += zmq_ns
+        if zmq_ns > self.zmq_send_max_ns:
+            self.zmq_send_max_ns = zmq_ns
+        self.put_bytes_total += payload_bytes
+        if payload_bytes > self.put_bytes_max:
+            self.put_bytes_max = payload_bytes
 
-    def record_get(self, total_us, zmq_us, hmac_us, unpickle_us):
+    def record_get(self, total_ns: int, zmq_ns: int, hmac_ns: int,
+                   unpickle_ns: int, payload_bytes: int):
         self.get_count += 1
-        self.get_total_us += total_us
-        if total_us > self.get_max_us:
-            self.get_max_us = total_us
-        self.zmq_recv_total_us += zmq_us
-        self.hmac_verify_total_us += hmac_us
-        self.unpickle_total_us += unpickle_us
+        self.get_total_ns += total_ns
+        if total_ns > self.get_max_ns:
+            self.get_max_ns = total_ns
+        if total_ns < self.get_min_ns:
+            self.get_min_ns = total_ns
+        self.zmq_recv_total_ns += zmq_ns
+        if zmq_ns > self.zmq_recv_max_ns:
+            self.zmq_recv_max_ns = zmq_ns
+        self.hmac_verify_total_ns += hmac_ns
+        if hmac_ns > self.hmac_verify_max_ns:
+            self.hmac_verify_max_ns = hmac_ns
+        self.unpickle_total_ns += unpickle_ns
+        if unpickle_ns > self.unpickle_max_ns:
+            self.unpickle_max_ns = unpickle_ns
+        self.get_bytes_total += payload_bytes
+        if payload_bytes > self.get_bytes_max:
+            self.get_bytes_max = payload_bytes
+
+    def record_put_async(self, total_ns: int):
+        self.put_async_count += 1
+        self.put_async_total_ns += total_ns
+
+    def record_get_async(self, total_ns: int):
+        self.get_async_count += 1
+        self.get_async_total_ns += total_ns
+
+    def _avg(self, total: int, count: int) -> int:
+        return total // count if count > 0 else 0
+
+    def _ns_to_str(self, ns: int) -> str:
+        """Format nanoseconds as the most readable unit."""
+        if ns >= 1_000_000:
+            return f"{ns / 1_000_000:.1f}ms"
+        if ns >= 1_000:
+            return f"{ns / 1_000:.1f}us"
+        return f"{ns}ns"
 
     def dump(self):
-        if self.put_count == 0 and self.get_count == 0:
+        if self.put_count == 0 and self.get_count == 0 and self.put_async_count == 0 and self.get_async_count == 0:
             return
-        put_avg = self.put_total_us // self.put_count if self.put_count else 0
-        get_avg = self.get_total_us // self.get_count if self.get_count else 0
-        pickle_avg = self.pickle_total_us // self.put_count if self.put_count else 0
-        hmac_avg = self.hmac_total_us // self.put_count if self.put_count else 0
-        zmq_send_avg = self.zmq_send_total_us // self.put_count if self.put_count else 0
-        unpickle_avg = self.unpickle_total_us // self.get_count if self.get_count else 0
-        hmac_v_avg = self.hmac_verify_total_us // self.get_count if self.get_count else 0
-        zmq_recv_avg = self.zmq_recv_total_us // self.get_count if self.get_count else 0
-        logger.info(
-            f"[MyelonInstr] {self.name} put: n={self.put_count} avg={put_avg}us max={self.put_max_us}us "
-            f"(pickle={pickle_avg}us hmac={hmac_avg}us zmq_send={zmq_send_avg}us) | "
-            f"get: n={self.get_count} avg={get_avg}us max={self.get_max_us}us "
-            f"(zmq_recv={zmq_recv_avg}us hmac_verify={hmac_v_avg}us unpickle={unpickle_avg}us)"
-        )
+        lines = [f"[MyelonInstr] === {self.name} IPC Stats ==="]
+        if self.put_count > 0:
+            avg = self._avg(self.put_total_ns, self.put_count)
+            avg_bytes = self._avg(self.put_bytes_total, self.put_count)
+            lines.append(
+                f"[MyelonInstr]   put(sync): n={self.put_count} "
+                f"avg={self._ns_to_str(avg)} min={self._ns_to_str(self.put_min_ns)} max={self._ns_to_str(self.put_max_ns)} "
+                f"avg_bytes={avg_bytes} max_bytes={self.put_bytes_max}"
+            )
+            lines.append(
+                f"[MyelonInstr]     pickle:   avg={self._ns_to_str(self._avg(self.pickle_total_ns, self.put_count))} "
+                f"max={self._ns_to_str(self.pickle_max_ns)}"
+            )
+            lines.append(
+                f"[MyelonInstr]     hmac:     avg={self._ns_to_str(self._avg(self.hmac_sign_total_ns, self.put_count))} "
+                f"max={self._ns_to_str(self.hmac_sign_max_ns)}"
+            )
+            lines.append(
+                f"[MyelonInstr]     zmq_send: avg={self._ns_to_str(self._avg(self.zmq_send_total_ns, self.put_count))} "
+                f"max={self._ns_to_str(self.zmq_send_max_ns)}"
+            )
+        if self.get_count > 0:
+            avg = self._avg(self.get_total_ns, self.get_count)
+            avg_bytes = self._avg(self.get_bytes_total, self.get_count)
+            lines.append(
+                f"[MyelonInstr]   get(sync): n={self.get_count} "
+                f"avg={self._ns_to_str(avg)} min={self._ns_to_str(self.get_min_ns)} max={self._ns_to_str(self.get_max_ns)} "
+                f"avg_bytes={avg_bytes} max_bytes={self.get_bytes_max}"
+            )
+            lines.append(
+                f"[MyelonInstr]     zmq_recv: avg={self._ns_to_str(self._avg(self.zmq_recv_total_ns, self.get_count))} "
+                f"max={self._ns_to_str(self.zmq_recv_max_ns)}"
+            )
+            lines.append(
+                f"[MyelonInstr]     hmac_v:   avg={self._ns_to_str(self._avg(self.hmac_verify_total_ns, self.get_count))} "
+                f"max={self._ns_to_str(self.hmac_verify_max_ns)}"
+            )
+            lines.append(
+                f"[MyelonInstr]     unpickle: avg={self._ns_to_str(self._avg(self.unpickle_total_ns, self.get_count))} "
+                f"max={self._ns_to_str(self.unpickle_max_ns)}"
+            )
+        if self.put_async_count > 0:
+            lines.append(
+                f"[MyelonInstr]   put(async): n={self.put_async_count} "
+                f"avg={self._ns_to_str(self._avg(self.put_async_total_ns, self.put_async_count))}"
+            )
+        if self.get_async_count > 0:
+            lines.append(
+                f"[MyelonInstr]   get(async): n={self.get_async_count} "
+                f"avg={self._ns_to_str(self._avg(self.get_async_total_ns, self.get_async_count))}"
+            )
+        for line in lines:
+            logger.info(line)
 
 
 class ZeroMqQueue:
@@ -248,25 +367,25 @@ class ZeroMqQueue:
         self._check_thread_safety()
         with nvtx_range_debug("send", color="blue", category="IPC"):
             if self._stats is not None:
-                t0 = time.monotonic()
-                data = self._prepare_data(obj)
-                t_pickle = time.monotonic()
-                # HMAC is included in _prepare_data when enabled
-                t_hmac = t_pickle  # already accounted for
+                t0 = _perf_ns()
+                data = pickle.dumps(obj)  # nosec B301
+                t_pickle = _perf_ns()
+                if self.use_hmac_encryption:
+                    data = self._sign_data(data)
+                t_hmac = _perf_ns()
                 self._send_data(data, routing_id=routing_id)
-                t_end = time.monotonic()
+                t_end = _perf_ns()
                 self._stats.record_put(
-                    int((t_end - t0) * 1e6),
-                    int((t_pickle - t0) * 1e6),
-                    0,  # hmac is inside _prepare_data
-                    int((t_end - t_pickle) * 1e6),
+                    t_end - t0,
+                    t_pickle - t0,
+                    t_hmac - t_pickle,
+                    t_end - t_hmac,
+                    len(data),
                 )
             elif self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
-                # Need manual serialization for encryption or ROUTER multipart
                 data = self._prepare_data(obj)
                 self._send_data(data, routing_id=routing_id)
             else:
-                # Standard socket without encryption - use pyobj directly
                 self.socket.send_pyobj(obj)
 
     def put_noblock(self,
@@ -303,13 +422,12 @@ class ZeroMqQueue:
     async def put_async(self, obj: Any, routing_id: Optional[bytes] = None):
         self.setup_lazily()
         self._check_thread_safety()
+        t0 = _perf_ns() if self._stats is not None else 0
         try:
             if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
-                # Need manual serialization for encryption or ROUTER multipart
                 data = self._prepare_data(obj)
                 await self._send_data_async(data, routing_id=routing_id)
             else:
-                # Standard socket without encryption
                 await self.socket.send_pyobj(obj)
         except TypeError as e:
             logger.error(f"Cannot pickle {obj}")
@@ -318,7 +436,8 @@ class ZeroMqQueue:
             logger.error(f"Error sending object: {e}")
             logger.error(traceback.format_exc())
             raise e
-
+        if self._stats is not None:
+            self._stats.record_put_async(_perf_ns() - t0)
         nvtx_mark("ipc.send", color="blue", category="IPC")
 
     async def put_async_noblock(self, obj: Any):
@@ -340,13 +459,42 @@ class ZeroMqQueue:
         self.setup_lazily()
         self._check_thread_safety()
         if self._stats is not None:
-            t0 = time.monotonic()
-            result = self._recv_data()
-            t_end = time.monotonic()
-            # _recv_data includes zmq recv + hmac verify + unpickle
+            t0 = _perf_ns()
+            # Inline the recv path for per-phase timing
+            if self.socket_type == zmq.ROUTER:
+                identity, raw_data = self.socket.recv_multipart()
+                self._last_identity = identity
+            else:
+                raw_data = self.socket.recv() if self.use_hmac_encryption else None
+            t_recv = _perf_ns()
+            if raw_data is not None:
+                payload_bytes = len(raw_data)
+                if self.use_hmac_encryption:
+                    message_data = raw_data[:-32]
+                    actual_hmac = raw_data[-32:]
+                    if not self._verify_hmac(message_data, actual_hmac):
+                        raise RuntimeError("HMAC verification failed")
+                    t_hmac = _perf_ns()
+                    result = pickle.loads(message_data)  # nosec B301
+                    t_unpickle = _perf_ns()
+                else:
+                    t_hmac = t_recv
+                    result = pickle.loads(raw_data)  # nosec B301
+                    t_unpickle = _perf_ns()
+            else:
+                # recv_pyobj path (no HMAC)
+                result = self.socket.recv_pyobj()
+                t_recv = _perf_ns()  # update after actual recv
+                t_hmac = t_recv
+                t_unpickle = t_recv
+                payload_bytes = 0
+            t_end = _perf_ns()
             self._stats.record_get(
-                int((t_end - t0) * 1e6),
-                0, 0, 0,  # breakdown not available for sync recv
+                t_end - t0,
+                t_recv - t0,
+                t_hmac - t_recv,
+                t_unpickle - t_hmac,
+                payload_bytes,
             )
             return result
         return self._recv_data()
@@ -354,7 +502,11 @@ class ZeroMqQueue:
     async def get_async(self) -> Any:
         self.setup_lazily()
         self._check_thread_safety()
-        return await self._recv_data_async()
+        t0 = _perf_ns() if self._stats is not None else 0
+        result = await self._recv_data_async()
+        if self._stats is not None:
+            self._stats.record_get_async(_perf_ns() - t0)
+        return result
 
     async def get_async_noblock(self,
                                 timeout: float = 0.5,
