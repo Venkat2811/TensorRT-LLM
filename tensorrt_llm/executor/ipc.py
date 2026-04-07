@@ -19,6 +19,69 @@ from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
                             print_colored)
 
 
+_MYELON_INSTRUMENT = os.environ.get('TRTLLM_MYELON_INSTRUMENT', '0') == '1'
+
+
+class _IpcStats:
+    """Lightweight IPC timing accumulator. Only active when TRTLLM_MYELON_INSTRUMENT=1."""
+
+    __slots__ = ('name', 'put_count', 'put_total_us', 'put_max_us',
+                 'get_count', 'get_total_us', 'get_max_us',
+                 'pickle_total_us', 'hmac_total_us', 'zmq_send_total_us',
+                 'unpickle_total_us', 'hmac_verify_total_us', 'zmq_recv_total_us')
+
+    def __init__(self, name: str):
+        self.name = name
+        self.put_count = 0
+        self.put_total_us = 0
+        self.put_max_us = 0
+        self.get_count = 0
+        self.get_total_us = 0
+        self.get_max_us = 0
+        self.pickle_total_us = 0
+        self.hmac_total_us = 0
+        self.zmq_send_total_us = 0
+        self.unpickle_total_us = 0
+        self.hmac_verify_total_us = 0
+        self.zmq_recv_total_us = 0
+
+    def record_put(self, total_us, pickle_us, hmac_us, zmq_us):
+        self.put_count += 1
+        self.put_total_us += total_us
+        if total_us > self.put_max_us:
+            self.put_max_us = total_us
+        self.pickle_total_us += pickle_us
+        self.hmac_total_us += hmac_us
+        self.zmq_send_total_us += zmq_us
+
+    def record_get(self, total_us, zmq_us, hmac_us, unpickle_us):
+        self.get_count += 1
+        self.get_total_us += total_us
+        if total_us > self.get_max_us:
+            self.get_max_us = total_us
+        self.zmq_recv_total_us += zmq_us
+        self.hmac_verify_total_us += hmac_us
+        self.unpickle_total_us += unpickle_us
+
+    def dump(self):
+        if self.put_count == 0 and self.get_count == 0:
+            return
+        put_avg = self.put_total_us // self.put_count if self.put_count else 0
+        get_avg = self.get_total_us // self.get_count if self.get_count else 0
+        pickle_avg = self.pickle_total_us // self.put_count if self.put_count else 0
+        hmac_avg = self.hmac_total_us // self.put_count if self.put_count else 0
+        zmq_send_avg = self.zmq_send_total_us // self.put_count if self.put_count else 0
+        unpickle_avg = self.unpickle_total_us // self.get_count if self.get_count else 0
+        hmac_v_avg = self.hmac_verify_total_us // self.get_count if self.get_count else 0
+        zmq_recv_avg = self.zmq_recv_total_us // self.get_count if self.get_count else 0
+        logger.info(
+            f"[MyelonInstr] {self.name} put: n={self.put_count} avg={put_avg}us max={self.put_max_us}us "
+            f"(pickle={pickle_avg}us hmac={hmac_avg}us zmq_send={zmq_send_avg}us) | "
+            f"get: n={self.get_count} avg={get_avg}us max={self.get_max_us}us "
+            f"(zmq_recv={zmq_recv_avg}us hmac_verify={hmac_v_avg}us unpickle={unpickle_avg}us)"
+        )
+
+
 class ZeroMqQueue:
     ''' A Queue-like container for IPC using ZeroMQ. '''
 
@@ -48,6 +111,7 @@ class ZeroMqQueue:
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
         '''
 
+        self._stats = _IpcStats(name or "unnamed") if _MYELON_INSTRUMENT else None
         self.socket_type = socket_type
         self.address_endpoint = address[
             0] if address is not None else "tcp://127.0.0.1:*"
@@ -183,7 +247,21 @@ class ZeroMqQueue:
         self.setup_lazily()
         self._check_thread_safety()
         with nvtx_range_debug("send", color="blue", category="IPC"):
-            if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
+            if self._stats is not None:
+                t0 = time.monotonic()
+                data = self._prepare_data(obj)
+                t_pickle = time.monotonic()
+                # HMAC is included in _prepare_data when enabled
+                t_hmac = t_pickle  # already accounted for
+                self._send_data(data, routing_id=routing_id)
+                t_end = time.monotonic()
+                self._stats.record_put(
+                    int((t_end - t0) * 1e6),
+                    int((t_pickle - t0) * 1e6),
+                    0,  # hmac is inside _prepare_data
+                    int((t_end - t_pickle) * 1e6),
+                )
+            elif self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
                 # Need manual serialization for encryption or ROUTER multipart
                 data = self._prepare_data(obj)
                 self._send_data(data, routing_id=routing_id)
@@ -261,6 +339,16 @@ class ZeroMqQueue:
     def get(self) -> Any:
         self.setup_lazily()
         self._check_thread_safety()
+        if self._stats is not None:
+            t0 = time.monotonic()
+            result = self._recv_data()
+            t_end = time.monotonic()
+            # _recv_data includes zmq recv + hmac verify + unpickle
+            self._stats.record_get(
+                int((t_end - t0) * 1e6),
+                0, 0, 0,  # breakdown not available for sync recv
+            )
+            return result
         return self._recv_data()
 
     async def get_async(self) -> Any:
@@ -342,6 +430,9 @@ class ZeroMqQueue:
         return data_before_encoding + hmac_signature
 
     def __del__(self):
+        if self._stats is not None:
+            self._stats.dump()
+            self._stats = None
         self.close()
 
     def _prepare_data(self, obj: Any) -> bytes:
