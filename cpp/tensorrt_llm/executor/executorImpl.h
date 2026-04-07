@@ -53,24 +53,78 @@ class MpiMessageQueue
 public:
     void push(MpiMessage&& message)
     {
-        std::lock_guard<std::mutex> const lock(mMutex);
-        mQueue.push(std::move(message));
-        mCv.notify_one();
+        auto pushStart = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> const lock(mMutex);
+            mQueue.push(std::move(message));
+            mCv.notify_one();
+        }
+        if (mInstrument)
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - pushStart)
+                               .count();
+            mPushCount.fetch_add(1, std::memory_order_relaxed);
+            mPushTotalUs.fetch_add(elapsed, std::memory_order_relaxed);
+            auto prev = mPushMaxUs.load(std::memory_order_relaxed);
+            while (elapsed > prev && !mPushMaxUs.compare_exchange_weak(prev, elapsed))
+            {
+            }
+        }
     }
 
     MpiMessage pop()
     {
+        auto popStart = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lock(mMutex);
         mCv.wait(lock, [this] { return !mQueue.empty(); });
         MpiMessage message = std::move(mQueue.front());
         mQueue.pop();
+        lock.unlock();
+        if (mInstrument)
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - popStart)
+                               .count();
+            mPopCount.fetch_add(1, std::memory_order_relaxed);
+            mPopTotalUs.fetch_add(elapsed, std::memory_order_relaxed);
+            auto prev = mPopMaxUs.load(std::memory_order_relaxed);
+            while (elapsed > prev && !mPopMaxUs.compare_exchange_weak(prev, elapsed))
+            {
+            }
+        }
         return message;
+    }
+
+    void enableInstrument()
+    {
+        mInstrument = true;
+    }
+
+    void dumpStats(char const* label) const
+    {
+        if (!mInstrument)
+            return;
+        auto pushN = mPushCount.load(std::memory_order_relaxed);
+        auto popN = mPopCount.load(std::memory_order_relaxed);
+        auto pushAvg = pushN > 0 ? mPushTotalUs.load(std::memory_order_relaxed) / pushN : 0;
+        auto popAvg = popN > 0 ? mPopTotalUs.load(std::memory_order_relaxed) / popN : 0;
+        TLLM_LOG_INFO("[MyelonInstr] %s queue: push=%ld ops avg=%ld us max=%ld us | pop=%ld ops avg=%ld us max=%ld us",
+            label, pushN, pushAvg, mPushMaxUs.load(std::memory_order_relaxed), popN, popAvg,
+            mPopMaxUs.load(std::memory_order_relaxed));
     }
 
 private:
     std::queue<MpiMessage> mQueue;
     std::mutex mMutex;
     std::condition_variable mCv;
+    bool mInstrument{false};
+    std::atomic<int64_t> mPushCount{0};
+    std::atomic<int64_t> mPushTotalUs{0};
+    std::atomic<int64_t> mPushMaxUs{0};
+    std::atomic<int64_t> mPopCount{0};
+    std::atomic<int64_t> mPopTotalUs{0};
+    std::atomic<int64_t> mPopMaxUs{0};
 };
 
 class Executor::Impl

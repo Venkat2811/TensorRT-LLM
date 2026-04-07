@@ -585,6 +585,16 @@ bool getEnvPrintSkipSoftmaxStat()
     return getBoolEnv("TRTLLM_PRINT_SKIP_SOFTMAX_STAT");
 }
 
+bool getEnvMyelonInstrument()
+{
+    static bool enabled = []()
+    {
+        char const* env = std::getenv("TRTLLM_MYELON_INSTRUMENT");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return enabled;
+}
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END

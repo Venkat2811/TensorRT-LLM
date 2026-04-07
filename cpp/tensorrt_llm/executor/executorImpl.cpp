@@ -16,6 +16,8 @@
  */
 
 #include "tensorrt_llm/executor/executorImpl.h"
+#include "tensorrt_llm/common/envUtils.h"
+#include <chrono>
 #include "tensorrt_llm/batch_manager/trtEncoderModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelFactory.h"
 #include "tensorrt_llm/common/assert.h"
@@ -702,6 +704,13 @@ void Executor::Impl::initializeOrchestrator(SizeType32 tp, SizeType32 pp, SizeTy
         MPICHECK(MPI_Barrier(intercomm));
     }
 
+    // Enable queue instrumentation if TRTLLM_MYELON_INSTRUMENT=1
+    if (tensorrt_llm::common::getEnvMyelonInstrument())
+    {
+        mSendQueue.enableInstrument();
+        TLLM_LOG_INFO("[MyelonInstr] Queue instrumentation enabled on orchestrator (rank %d)", mOrchRank);
+    }
+
     // Spawn the thread responsible for sending new requests to the leader of the model
     mOrchSendReqThread = std::thread(&Impl::orchSendReqThread, this);
 
@@ -838,6 +847,13 @@ void Executor::Impl::initializeWorkers(SizeType32 tp, SizeType32 pp, SizeType32 
             mDeviceId = worldConfig.getDevice();
         }
         // Spawn the thread responsible for receiving new requests from the orchestrator
+        // Enable queue instrumentation if TRTLLM_MYELON_INSTRUMENT=1
+        if (tensorrt_llm::common::getEnvMyelonInstrument())
+        {
+            mSendQueue.enableInstrument();
+            TLLM_LOG_INFO("[MyelonInstr] Queue instrumentation enabled on leader (rank %d)", mWorldRank);
+        }
+
         mLeaderRecvReqThread = std::thread(&Impl::leaderRecvReqThread, this);
 
         // Spawn the thread responsible for sending new responses to the orchestrator
@@ -2436,6 +2452,10 @@ void Executor::Impl::enqueueNewResponses(std::vector<Response>&& newResponses)
 void Executor::Impl::orchSendReqThread()
 {
     tensorrt_llm::common::setThreadName("orchSendReq");
+    bool const instrument = tensorrt_llm::common::getEnvMyelonInstrument();
+    int64_t mpiSendCount = 0;
+    int64_t mpiSendTotalUs = 0;
+    int64_t mpiSendMaxUs = 0;
 
     while (true)
     {
@@ -2444,6 +2464,13 @@ void Executor::Impl::orchSendReqThread()
         if (message.id == MpiId::TERMINATION)
         {
             mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kOrchestratorId);
+            if (instrument)
+            {
+                mSendQueue.dumpStats("orchSendReq");
+                auto avg = mpiSendCount > 0 ? mpiSendTotalUs / mpiSendCount : 0;
+                TLLM_LOG_INFO(
+                    "[MyelonInstr] orchSendReq MPI_Send: count=%ld avg=%ld us max=%ld us", mpiSendCount, avg, mpiSendMaxUs);
+            }
             TLLM_LOG_INFO("Orchestrator sendReq thread exiting");
             break;
         }
@@ -2472,9 +2499,20 @@ void Executor::Impl::orchSendReqThread()
             }
             else
             {
+                auto t0 = instrument ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kOrchestratorId);
                 mOrchLeaderComm->send(
                     packed.data(), packed.size(), mpi::MpiType::kCHAR, mLeaderRank, mpi::MpiTag::kOrchestratorData);
+                if (instrument)
+                {
+                    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                                       .count();
+                    mpiSendCount++;
+                    mpiSendTotalUs += elapsed;
+                    if (elapsed > mpiSendMaxUs)
+                        mpiSendMaxUs = elapsed;
+                }
             }
         }
         else if (message.id == MpiId::CANCEL_REQUEST)
@@ -2592,6 +2630,11 @@ void Executor::Impl::leaderSendThread(MpiMessageQueue& sendQueue, mpi::MpiTag id
     TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
 
 #if ENABLE_MULTI_DEVICE
+    bool const instrument = tensorrt_llm::common::getEnvMyelonInstrument();
+    int64_t mpiSendCount = 0;
+    int64_t mpiSendTotalUs = 0;
+    int64_t mpiSendMaxUs = 0;
+
     while (true)
     {
         auto message = sendQueue.pop();
@@ -2599,6 +2642,13 @@ void Executor::Impl::leaderSendThread(MpiMessageQueue& sendQueue, mpi::MpiTag id
         if (message.id == MpiId::TERMINATION)
         {
             mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mOrchRank, idTag);
+            if (instrument)
+            {
+                sendQueue.dumpStats("leaderSend");
+                auto avg = mpiSendCount > 0 ? mpiSendTotalUs / mpiSendCount : 0;
+                TLLM_LOG_INFO(
+                    "[MyelonInstr] leaderSend MPI_Send: count=%ld avg=%ld us max=%ld us", mpiSendCount, avg, mpiSendMaxUs);
+            }
             TLLM_LOG_INFO("Leader sendThread exiting");
             break;
         }
@@ -2624,8 +2674,21 @@ void Executor::Impl::leaderSendThread(MpiMessageQueue& sendQueue, mpi::MpiTag id
                 TLLM_LOG_DEBUG("Leader sendResp thread sending iter request stats");
                 buffer = Serialization::serialize(requestIterStatsData.requestStatsPerIterationVec);
             }
-            mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mOrchRank, idTag);
-            mOrchLeaderComm->send(buffer.data(), buffer.size(), mpi::MpiType::kCHAR, mOrchRank, dataTag);
+            {
+                auto t0 = instrument ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mOrchRank, idTag);
+                mOrchLeaderComm->send(buffer.data(), buffer.size(), mpi::MpiType::kCHAR, mOrchRank, dataTag);
+                if (instrument)
+                {
+                    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                                       .count();
+                    mpiSendCount++;
+                    mpiSendTotalUs += elapsed;
+                    if (elapsed > mpiSendMaxUs)
+                        mpiSendMaxUs = elapsed;
+                }
+            }
         }
         else
         {
@@ -2640,6 +2703,11 @@ void Executor::Impl::orchRecvThread(mpi::MpiTag idTag, mpi::MpiTag dataTag)
     tensorrt_llm::common::setThreadName("orchRecv");
 
 #if ENABLE_MULTI_DEVICE
+    bool const instrument = tensorrt_llm::common::getEnvMyelonInstrument();
+    int64_t mpiRecvCount = 0;
+    int64_t mpiRecvTotalUs = 0;
+    int64_t mpiRecvMaxUs = 0;
+
     while (true)
     {
         if (mRecvPollPeriodMs > 0)
@@ -2647,6 +2715,7 @@ void Executor::Impl::orchRecvThread(mpi::MpiTag idTag, mpi::MpiTag dataTag)
             mOrchLeaderComm->recvPoll(mOrchRank, mpi::MpiTag::kOrchestratorId, mRecvPollPeriodMs);
         }
 
+        auto t0 = instrument ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         MPI_Message msg = nullptr;
         MPI_Status status;
         mOrchLeaderComm->mprobe(mLeaderRank, idTag, &msg, &status);
@@ -2660,6 +2729,12 @@ void Executor::Impl::orchRecvThread(mpi::MpiTag idTag, mpi::MpiTag dataTag)
 
         if (mpiId == MpiId::TERMINATION)
         {
+            if (instrument)
+            {
+                auto avg = mpiRecvCount > 0 ? mpiRecvTotalUs / mpiRecvCount : 0;
+                TLLM_LOG_INFO(
+                    "[MyelonInstr] orchRecv MPI_Recv: count=%ld avg=%ld us max=%ld us", mpiRecvCount, avg, mpiRecvMaxUs);
+            }
             TLLM_LOG_INFO("Orchestrator recv thread exiting");
             break;
         }
@@ -2670,6 +2745,17 @@ void Executor::Impl::orchRecvThread(mpi::MpiTag idTag, mpi::MpiTag dataTag)
 
             std::vector<char> buffer(count);
             MPICHECK(MPI_Mrecv(buffer.data(), count, MPI_CHAR, &msg, &status)); // NOLINT
+
+            if (instrument)
+            {
+                auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                                   .count();
+                mpiRecvCount++;
+                mpiRecvTotalUs += elapsed;
+                if (elapsed > mpiRecvMaxUs)
+                    mpiRecvMaxUs = elapsed;
+            }
 
             if (mpiId == MpiId::RESPONSE)
             {

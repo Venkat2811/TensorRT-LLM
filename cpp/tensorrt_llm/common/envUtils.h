@@ -170,6 +170,9 @@ bool getEnvEplbForceGdrcopy();
 
 bool getEnvPrintSkipSoftmaxStat();
 
+// Enable Myelon IPC instrumentation (TRTLLM_MYELON_INSTRUMENT=1)
+bool getEnvMyelonInstrument();
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END
