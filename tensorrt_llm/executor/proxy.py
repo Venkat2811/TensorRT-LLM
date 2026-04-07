@@ -331,6 +331,14 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.rpc_client = None
 
         # close all the sockets
+        # Dump IPC stats before closing queues
+        for q in [self.request_queue, self.worker_init_status_queue, self.result_queue]:
+            if hasattr(q, '_stats') and q._stats is not None:
+                q._stats.dump()
+            # Also check inner queue for FusedIpcQueue
+            if hasattr(q, 'queue') and hasattr(q.queue, '_stats') and q.queue._stats is not None:
+                q.queue._stats.dump()
+
         self.request_queue.close()
         self.worker_init_status_queue.close()
         self.result_queue.close()

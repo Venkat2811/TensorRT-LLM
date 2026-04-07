@@ -117,6 +117,14 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                     self._executor_config.checkpoint_loader.cleanup()
                     self._executor_config.checkpoint_loader = None
 
+        # Dump IPC stats before shutdown completes
+        for attr in ['request_queue', 'result_queue', 'worker_init_status_queue']:
+            q = getattr(self, attr, None)
+            if q is not None and hasattr(q, '_stats') and q._stats is not None:
+                q._stats.dump()
+            if q is not None and hasattr(q, 'queue') and hasattr(q.queue, '_stats') and q.queue._stats is not None:
+                q.queue._stats.dump()
+
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
 
